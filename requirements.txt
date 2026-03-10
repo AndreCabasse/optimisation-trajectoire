@@ -1,0 +1,27 @@
+# Core scientific libraries
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+
+# Data parsing
+lxml>=4.9.0
+fastkml>=1.0.0
+
+# Coordinate transformations
+pyproj>=3.5.0
+
+# Weather data
+requests>=2.28.0
+python-dateutil>=2.8.0
+
+# Visualization
+plotly>=5.14.0
+folium>=0.14.0
+
+# Dashboard interactif
+streamlit>=1.28.0
+
+# Development & Testing
+pytest>=7.3.0
+black>=23.0.0
+pytest-cov>=4.1.0
