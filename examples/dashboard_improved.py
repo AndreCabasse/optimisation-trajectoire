@@ -6,11 +6,11 @@ import streamlit as st
 import sys
 from pathlib import Path
 import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import pandas as pd  # type: ignore
+import plotly.graph_objects as go  # type: ignore
+from plotly.subplots import make_subplots  # type: ignore
 import folium
-from streamlit_folium import st_folium
+from streamlit_folium import st_folium  # type: ignore
 from datetime import datetime, timedelta
 import time
 
@@ -20,6 +20,8 @@ from src.data.kml_parser import KMLParser
 from src.optimization.trajectory_optimizer import TrajectoryOptimizer, OptimizationMethod
 from src.data.data_models import Trajectory
 from src.weather.weather_api import WeatherAPI
+from src.prediction.bilstm_predictor import BiLSTMPredictor
+from src.prediction.spoofing_injector import SpoofingInjector, SpoofingType, SpoofingConfig
 
 # ==================== CONFIGURATION DE LA PAGE ====================
 st.set_page_config(
@@ -773,7 +775,60 @@ with st.sidebar:
     optimize_button = st.button("🚀 LANCER L'OPTIMISATION", type="primary", use_container_width=True)
     
     st.markdown("---")
-    
+
+    # ---- Section Bi-LSTM ----
+    st.markdown("### 🧠 Détection Bi-LSTM")
+    lstm_enabled = st.checkbox(
+        "Activer la détection Bi-LSTM",
+        help="Entraîne un Bi-LSTM sur la trajectoire propre, injecte du spoofing, puis détecte l'onset."
+    )
+
+    # Valeurs par défaut (accessibles hors du bloc if)
+    lstm_epochs          = 30
+    lstm_window          = 50
+    lstm_sigma           = 4.0
+    lstm_onset_k         = 3
+    spoofing_type_str    = "Position offset"
+    spoofing_intensity   = "Moyenne"
+    spoofing_start_pct   = 50
+    lstm_button          = False
+
+    if lstm_enabled:
+        st.markdown("**🧠 Modèle**")
+        lstm_epochs = st.slider("Epochs d'entraînement", 10, 100, 30, step=5,
+                                help="Plus d'époques = meilleure précision (mais plus lent).")
+        lstm_window = st.slider("Fenêtre temporelle (points)", 20, 100, 50, step=5,
+                                help="Nombre de points passés pour prédire le suivant.")
+
+        st.markdown("**💉 Injection de Spoofing**")
+        spoofing_type_str = st.selectbox(
+            "Type de spoofing",
+            ["Position offset", "Dérive progressive", "Altitude figée", "Combiné"],
+            help="Position offset : saut soudain · Dérive : décalage croissant · Altitude figée : alt bloquée · Combiné : mix"
+        )
+        spoofing_intensity = st.select_slider(
+            "Intensité",
+            options=["Légère", "Moyenne", "Forte"],
+            value="Moyenne"
+        )
+        spoofing_start_pct = st.slider(
+            "Début du spoofing (% de la trajectoire)", 5, 90, 50, step=5,
+            help="À partir de quel point de la trajectoire le spoofing est injecté."
+        )
+
+        with st.expander("⚙️ Paramètres avancés"):
+            lstm_sigma = st.number_input(
+                "Sigma (seuils adaptatifs)", value=4.0, step=0.5, min_value=1.0, max_value=10.0,
+                help="Seuil = mean(résidu) + sigma × std(résidu). Plus grand = moins sensible."
+            )
+            lstm_onset_k = st.number_input(
+                "Points consécutifs pour l'onset", value=3, step=1, min_value=1, max_value=10,
+                help="Nombre de points suspects consécutifs avant de déclarer l'onset."
+            )
+        lstm_button = st.button("🧠 INJECTER & DÉTECTER", use_container_width=True, type="primary")
+
+    st.markdown("---")
+
     # Aide sur les méthodes
     with st.expander("📚 Détails des Méthodes"):
         for method, info in {k: get_method_info(k) for k in ["Kalman", "B-spline", "Hybride", "Météo", "Collocation Directe"]}.items():
@@ -790,6 +845,14 @@ if 'optimized_trajectory' not in st.session_state:
     st.session_state.optimized_trajectory = None
 if 'optimization_time' not in st.session_state:
     st.session_state.optimization_time = 0
+if 'bilstm_results' not in st.session_state:
+    st.session_state.bilstm_results = None
+if 'bilstm_df' not in st.session_state:
+    st.session_state.bilstm_df = None
+if 'bilstm_df_clean' not in st.session_state:
+    st.session_state.bilstm_df_clean = None
+if 'bilstm_injection_idx' not in st.session_state:
+    st.session_state.bilstm_injection_idx = None
 
 # Charger la trajectoire
 if uploaded_file is None:
@@ -1143,6 +1206,297 @@ if st.session_state.optimization_result is not None and trajectory:
                 use_container_width=True
             )
 
+# ==================== SECTION BI-LSTM ====================
+if lstm_enabled and trajectory:
+
+    if lstm_button:
+        st.markdown("---")
+        st.markdown("## 🧠 Détection Bi-LSTM de Spoofing")
+
+        # ---- Injection de spoofing ----
+        n_pts     = len(trajectory)
+        start_idx = int((spoofing_start_pct / 100) * n_pts)
+
+        spoof_type_map = {
+            "Position offset":    SpoofingType.POSITION_OFFSET,
+            "Dérive progressive": SpoofingType.GRADUAL_DRIFT,
+            "Altitude figée":     SpoofingType.ALTITUDE_FREEZE,
+            "Combiné":            SpoofingType.COMBINED,
+        }
+        config = SpoofingInjector.from_intensity(
+            spoof_type=spoof_type_map[spoofing_type_str],
+            start_index=start_idx,
+            intensity=spoofing_intensity,
+        )
+        spoofed_traj = SpoofingInjector.inject(trajectory, config)
+        st.session_state.bilstm_injection_idx = start_idx
+
+        # ---- Prédicteur ----
+        predictor = BiLSTMPredictor(
+            window_size=lstm_window,
+            epochs=lstm_epochs,
+            threshold_sigma=float(lstm_sigma),
+            onset_min_consecutive=int(lstm_onset_k),
+        )
+
+        df_clean   = predictor.trajectory_to_dataframe(trajectory)
+        df_spoofed = predictor.trajectory_to_dataframe(spoofed_traj)
+        st.session_state.bilstm_df = df_spoofed
+        st.session_state.bilstm_df_clean = df_clean
+
+        if len(df_clean) < lstm_window + 2:
+            st.error(
+                f"❌ Trajectoire trop courte : {len(df_clean)} points disponibles, "
+                f"{lstm_window + 2} requis."
+            )
+        else:
+            progress_bar_lstm = st.progress(0, text="Entraînement sur trajectoire propre…")
+
+            try:
+                from keras.callbacks import LambdaCallback  # type: ignore
+
+                def on_epoch_end(epoch, logs):
+                    pct = int((epoch + 1) / lstm_epochs * 100)
+                    val_loss = logs.get('val_loss', float('nan'))
+                    progress_bar_lstm.progress(
+                        min(pct, 100),
+                        text=f"Epoch {epoch+1}/{lstm_epochs} — val_loss: {val_loss:.6f}"
+                    )
+
+                cb = LambdaCallback(on_epoch_end=on_epoch_end)
+                # Entraînement sur la trajectoire PROPRE
+                predictor.train(df_clean, verbose=0, callbacks=[cb])
+                progress_bar_lstm.progress(100, text="Entraînement terminé ✅")
+
+                # Prédiction sur la trajectoire SPOOFÉE
+                with st.spinner("Prédiction sur trajectoire spoofée…"):
+                    results = predictor.predict(df_spoofed)
+                st.session_state.bilstm_results = results
+
+            except ImportError as e:
+                st.error(str(e))
+                st.stop()
+
+    # ---- Afficher les résultats ----
+    if st.session_state.bilstm_results is not None and st.session_state.bilstm_df is not None:
+        results        = st.session_state.bilstm_results
+        injection_idx  = st.session_state.get('bilstm_injection_idx', None)
+
+        if not lstm_button:
+            st.markdown("---")
+            st.markdown("## 🧠 Détection Bi-LSTM de Spoofing")
+
+        # Métriques globales
+        risk_pct   = results['risk_score'] * 100
+        risk_color = "🟢" if risk_pct < 5 else ("🟡" if risk_pct < 20 else ("🟠" if risk_pct < 50 else "🔴"))
+        onset      = results.get('onset_index')
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Points analysés", results['n_total'])
+        col2.metric("Points suspects", results['n_spoofed'],
+                    delta=f"+{results['n_spoofed']}" if results['n_spoofed'] > 0 else None,
+                    delta_color="inverse")
+        col3.metric("Score de risque", f"{risk_pct:.1f}%")
+        col4.metric(
+            "Verdict",
+            f"{risk_color} {'Sûr' if risk_pct < 5 else 'Anomalie' if risk_pct < 20 else 'Risque élevé' if risk_pct < 50 else 'Spoofing probable'}"
+        )
+
+        # Bannière d'onset
+        if results.get('onset_detected') and onset is not None:
+            delay = (onset - injection_idx) if injection_idx is not None else "N/A"
+            delay_str = f"{delay} points après l'injection" if isinstance(delay, int) else delay
+            st.success(
+                f"🎯 **Spoofing détecté !**  "
+                f"Injecté au point **{injection_idx}** · Détecté au point **{onset}** "
+                f"(retard : {delay_str})",
+                icon="🎯"
+            )
+        else:
+            st.warning(
+                "⚠️ Aucun onset détecté — augmentez l'intensité, diminuez le sigma "
+                "ou réduisez le nombre de points consécutifs requis.",
+                icon="⚠️"
+            )
+
+        # Seuils calibrés
+        with st.expander("🔧 Seuils adaptatifs calibrés automatiquement"):
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Seuil latitude (°)",  f"{results['lat_threshold']:.6f}")
+            c2.metric("Seuil longitude (°)", f"{results['lon_threshold']:.6f}")
+            c3.metric("Seuil altitude (m)",  f"{results['alt_threshold']:.2f}")
+
+        tab_map, tab_err, tab_data = st.tabs(
+            ["🗺️ Carte", "📈 Erreurs temporelles", "📋 Données brutes"]
+        )
+
+        # --- Onglet carte ---
+        with tab_map:
+            st.caption(
+                "� Trajectoire originale · 🔵 Trajectoire spoofée reçue · "
+                "🔴 Points suspects · 💉 Point d'injection · 🎯 Onset détecté"
+            )
+            real        = results['real']
+            spoof_flags = results['spoof_flags']
+            res_indices = results['indices']
+            fig_map     = go.Figure()
+
+            # Trajectoire originale (propre)
+            df_orig = st.session_state.get('bilstm_df_clean')
+            if df_orig is not None:
+                fig_map.add_trace(go.Scattergeo(
+                    lat=df_orig['lat'].values,
+                    lon=df_orig['lon'].values,
+                    mode='lines',
+                    name='Trajectoire originale',
+                    line=dict(color='limegreen', width=2, dash='dash'),
+                ))
+
+            fig_map.add_trace(go.Scattergeo(
+                lat=real[:, 0], lon=real[:, 1],
+                mode='lines',
+                name='Trajectoire spoofée reçue',
+                line=dict(color='dodgerblue', width=2),
+            ))
+
+            sus_idx = np.where(spoof_flags)[0]
+            if len(sus_idx) > 0:
+                fig_map.add_trace(go.Scattergeo(
+                    lat=real[sus_idx, 0], lon=real[sus_idx, 1],
+                    mode='markers',
+                    name='Points suspects',
+                    marker=dict(color='red', size=5, symbol='x'),
+                ))
+
+            if onset is not None:
+                onset_local = onset - res_indices[0]
+                if 0 <= onset_local < len(real):
+                    fig_map.add_trace(go.Scattergeo(
+                        lat=[real[onset_local, 0]], lon=[real[onset_local, 1]],
+                        mode='markers+text',
+                        name=f'Onset détecté (pt {onset})',
+                        marker=dict(color='red', size=16, symbol='star'),
+                        text=['🎯'], textfont=dict(size=14),
+                    ))
+
+            if injection_idx is not None:
+                inj_local = injection_idx - res_indices[0]
+                if 0 <= inj_local < len(real):
+                    fig_map.add_trace(go.Scattergeo(
+                        lat=[real[inj_local, 0]], lon=[real[inj_local, 1]],
+                        mode='markers+text',
+                        name=f'Injection (pt {injection_idx})',
+                        marker=dict(color='orange', size=16, symbol='diamond'),
+                        text=['💉'], textfont=dict(size=14),
+                    ))
+
+            center_lat = float(np.mean(real[:, 0]))
+            center_lon = float(np.mean(real[:, 1]))
+            fig_map.update_layout(
+                geo=dict(
+                    center=dict(lat=center_lat, lon=center_lon),
+                    projection_scale=50,
+                    showland=True,  landcolor='rgb(243,243,243)',
+                    showocean=True, oceancolor='rgb(204,229,255)',
+                    showcoastlines=True,
+                ),
+                height=500,
+                margin=dict(l=0, r=0, t=30, b=0),
+                legend=dict(x=0.01, y=0.99),
+            )
+            st.plotly_chart(fig_map, use_container_width=True)
+
+        # --- Onglet erreurs ---
+        with tab_err:
+            fig_err = make_subplots(
+                rows=3, cols=1,
+                subplot_titles=("Erreur altitude (m)", "Erreur latitude (°)", "Erreur longitude (°)"),
+                vertical_spacing=0.10,
+            )
+            t = list(range(len(results['alt_errs'])))
+
+            fig_err.add_trace(
+                go.Scatter(x=t, y=results['alt_errs'], name='Erreur alt',
+                           line=dict(color='steelblue')), row=1, col=1
+            )
+            fig_err.add_hline(y=results['alt_threshold'], line_dash='dash',
+                              line_color='red', annotation_text='seuil', row=1, col=1)
+
+            fig_err.add_trace(
+                go.Scatter(x=t, y=results['lat_errs'], name='Erreur lat',
+                           line=dict(color='seagreen')), row=2, col=1
+            )
+            fig_err.add_hline(y=results['lat_threshold'], line_dash='dash',
+                              line_color='red', annotation_text='seuil', row=2, col=1)
+
+            fig_err.add_trace(
+                go.Scatter(x=t, y=results['lon_errs'], name='Erreur lon',
+                           line=dict(color='darkorange')), row=3, col=1
+            )
+            fig_err.add_hline(y=results['lon_threshold'], line_dash='dash',
+                              line_color='red', annotation_text='seuil', row=3, col=1)
+
+            # Ligne verticale : injection (orange pointillé)
+            if injection_idx is not None:
+                inj_t = injection_idx - res_indices[0]
+                fig_err.add_vline(x=inj_t, line_color='orange', line_dash='dot',
+                                  annotation_text='Injection',
+                                  annotation_position='top left')
+
+            # Ligne verticale : onset détecté (rouge)
+            if onset is not None:
+                onset_t = onset - res_indices[0]
+                fig_err.add_vline(x=onset_t, line_color='red', line_dash='dash',
+                                  annotation_text='Onset détecté',
+                                  annotation_position='top right')
+
+            # Zones rouges sur les points suspects
+            for idx in np.where(results['spoof_flags'])[0]:
+                for row_n in [1, 2, 3]:
+                    fig_err.add_vrect(
+                        x0=idx - 0.5, x1=idx + 0.5,
+                        fillcolor='rgba(255,0,0,0.12)', line_width=0,
+                        row=row_n, col=1
+                    )
+
+            fig_err.update_layout(
+                height=600, showlegend=False,
+                title_text="Erreurs de prédiction · orange = injection · rouge = onset détecté",
+                title_x=0.5
+            )
+            st.plotly_chart(fig_err, use_container_width=True)
+
+        # --- Onglet données ---
+        with tab_data:
+            df_results = pd.DataFrame({
+                'Index':          results['indices'],
+                'Lat reçue':      results['real'][:, 0],
+                'Lon reçue':      results['real'][:, 1],
+                'Alt reçue (m)':  results['real'][:, 2],
+                'Lat prédite':    results['predicted'][:, 0],
+                'Lon prédite':    results['predicted'][:, 1],
+                'Alt prédite (m)':results['predicted'][:, 2],
+                'Err alt (m)':    results['alt_errs'],
+                'Err lat (°)':    results['lat_errs'],
+                'Err lon (°)':    results['lon_errs'],
+                'Suspect':        results['spoof_flags'],
+            })
+            st.dataframe(
+                df_results.style.applymap(
+                    lambda v: 'background-color: #ffe0e0' if v is True else '',
+                    subset=['Suspect']
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+            csv_lstm = df_results.to_csv(index=False)
+            st.download_button(
+                "📥 Exporter résultats Bi-LSTM (CSV)",
+                data=csv_lstm,
+                file_name=f"bilstm_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+            )
+
 # Message si aucune optimisation
 elif trajectory and st.session_state.optimization_result is None:
     st.markdown("""
@@ -1173,6 +1527,7 @@ st.markdown("""
         <span class="badge badge-success">5 Méthodes d'Optimisation</span>
         <span class="badge badge-info">Visualisation 3D</span>
         <span class="badge badge-warning">Données Météo</span>
+        <span class="badge badge-warning">🧠 Bi-LSTM</span>
     </p>
 </div>
 """, unsafe_allow_html=True)

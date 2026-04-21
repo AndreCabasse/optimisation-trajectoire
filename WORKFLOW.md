@@ -392,6 +392,40 @@ print(f"Carburant économisé (estimé) : {optimizer.fuel_saved} kg")
 
 ---
 
+## ✂️ Optimisation Partielle — Choisir un Point de Départ
+
+Utile pour préserver les phases critiques (décollage, approche) et n'optimiser que la croisière.
+
+### Par temps écoulé
+
+```python
+optimizer = TrajectoryOptimizer(method=OptimizationMethod.HYBRID)
+result = optimizer.optimize(trajectory, target_points=100, start_time=600)  # après 10 min
+```
+
+### Par distance parcourue
+
+```python
+result = optimizer.optimize(trajectory, target_points=100, start_distance=50000)  # après 50 km
+```
+
+### Recommandations pour un vol commercial
+
+| Phase | Paramètre suggéré | Action |
+|-------|-------------------|--------|
+| Décollage + montée (0–10 min) | — | **Préserver** (trajectoire ATC) |
+| Croisière (10–50 min) | `start_time=600` | **Optimiser** (maximum d'économie) |
+| Descente + approche | `start_time=<fin croisière>` | **Optimiser légèrement** |
+
+Utiliser `start_time` pour les analyses temporelles, `start_distance` pour les analyses géographiques (zones ATC).
+
+**Script d'exemple** :
+```bash
+python examples/example_partial_optimization.py
+```
+
+---
+
 ## 📁 Structure des Fichiers de Sortie
 
 ### **Outputs générés par le système :**
@@ -530,11 +564,9 @@ graph LR
 ### **Documentation Détaillée**
 
 - [README.md](README.md) : Vue d'ensemble du projet
-- [QUICKSTART.md](QUICKSTART.md) : Démarrage rapide
-- [AMELIORATIONS_PRECISION.md](AMELIORATIONS_PRECISION.md) : Améliorations de précision
-- [SPOOFING_DETECTION_ADVANCED.md](SPOOFING_DETECTION_ADVANCED.md) : Détection avancée
-- [COMPARAISON_METHODES.md](COMPARAISON_METHODES.md) : Comparaison des méthodes
-- [GUIDE_UTILISATION_SPOOFING.md](GUIDE_UTILISATION_SPOOFING.md) : Guide spoofing
+- [METHODES_OPTIMISATION.md](METHODES_OPTIMISATION.md) : Analyse et comparaison des méthodes
+- [CHANGELOG_2026.md](CHANGELOG_2026.md) : Corrections et améliorations 2026
+- [SPOOFING.md](SPOOFING.md) : Détection de spoofing GPS/ADS-B
 
 ### **Code Source**
 

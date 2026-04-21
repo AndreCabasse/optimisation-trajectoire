@@ -44,6 +44,29 @@ Ce projet permet de :
 pip install -r requirements.txt
 ```
 
+## ⚡ Démarrage Rapide
+
+```python
+from src.data.kml_parser import KMLParser
+from src.optimization.trajectory_optimizer import TrajectoryOptimizer, OptimizationMethod
+
+parser = KMLParser('data/sample/F-HZUE-track-EGM96.kml')
+trajectory = parser.parse()
+
+optimizer = TrajectoryOptimizer(method=OptimizationMethod.HYBRID)
+result = optimizer.optimize(trajectory, target_points=100)
+
+print(f"Compression : {result.metrics['compression_ratio']:.2%}")
+print(f"Smoothness  : {result.metrics['smoothness']:.2f}")
+```
+
+Sorties générées : `output/comparison.png`, `output/trajectory_map.html`
+
+### Obtenir des données KML
+
+- **OpenSky Network** : https://opensky-network.org/ → rechercher un vol → exporter KML
+- **FlightRadar24** : https://www.flightradar24.com/ (compte premium requis)
+
 ## 📦 Dépendances Principales
 
 - `numpy` - Calculs numériques
@@ -144,7 +167,7 @@ python examples/compare_methods.py  # Comparaison complète
 python examples/radar_comparison.py  # Graphique radar
 ```
 
-📖 Voir [COMPARAISON_METHODES.md](COMPARAISON_METHODES.md) pour l'analyse détaillée
+📖 Voir [METHODES_OPTIMISATION.md](METHODES_OPTIMISATION.md) pour l'analyse détaillée et les corrections implémentées.
 
 ## 🌤️ Intégration Météo
 
